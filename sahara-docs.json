@@ -1,5 +1,5 @@
 {
   "mount": "threadlanes",
-  "path": "docs",
+  "path": "src/pytest_threadlanes/sahara_docs",
   "owner": "morphine"
 }

@@ -1,0 +1,358 @@
+"""Fail closed: check every pytest/pluggy/xdist internal we rely on, before running.
+
+Each check returns a problem description, or ``None`` when the touchpoint looks
+the way the code in ``isolation.py``, ``capture.py``, ``hookrouting.py`` and
+``scheduling.py`` expects. Any problem stops the run with ``UsageError`` rather
+than letting lanes run incorrectly. The IDs match the touchpoint tables in
+CLAUDE.md and DESIGN.md.
+
+X1 is also checked on each scheduler instance (``scheduling.make_scheduler``).
+X2 (hybrid worker) is resolved where it is used. X3 and X4 (hybrid controller)
+are checked by ``check_controller_touchpoints``.
+
+Not probed (a gap carried over from the original single-file plugin): P1
+``session._setupstate``, which the contract tests cover.
+"""
+from __future__ import annotations
+
+import sys
+
+import pytest
+
+
+def _p2_fixture_caches(config):
+    from _pytest.fixtures import FixtureDef
+    from _pytest import setuponly
+
+    problems = []
+    names = set(FixtureDef.__init__.__code__.co_names)
+    if not FixtureDef.__dict__.get("_lanes_patched") and not {"cached_result", "_finalizers"} <= names:
+        problems.append("P2 FixtureDef.cached_result/_finalizers")
+    if getattr(FixtureDef, "__slots__", None):
+        problems.append("P2 FixtureDef now uses __slots__")
+    if not hasattr(FixtureDef, "__weakref__"):
+        problems.append("P2 FixtureDef instances can no longer be weakly referenced")
+    if "cached_param" not in setuponly.pytest_fixture_setup.__code__.co_names:
+        problems.append("P2 --setup-show no longer keeps FixtureDef.cached_param")
+    return "\n  ".join(problems) or None
+
+
+def _p3_logging(config):
+    lp = config.pluginmanager.get_plugin("logging-plugin")
+    if lp is None:
+        return None
+    if not all(hasattr(lp, a) for a in ("caplog_handler", "report_handler", "log_level")):
+        return "P3 LoggingPlugin.caplog_handler/report_handler/log_level"
+    # capture._LogDispatch stands in for these handlers and clones one per lane.
+    try:
+        clone = type(lp.caplog_handler)()
+    except TypeError as e:
+        return f"P3 LoggingPlugin handler class can no longer be made without arguments ({e})"
+    if not all(hasattr(clone, a) for a in ("records", "stream", "reset", "clear")):
+        return "P3 LogCaptureHandler.records/stream/reset/clear"
+    return None
+
+
+def _p8_logger_dict(config):
+    import logging
+
+    if type(getattr(logging.Logger.manager, "loggerDict", None)) is not dict:
+        return "P8 logging.Logger.manager.loggerDict is not a plain dict"
+    return None
+
+
+def _p9_doctest_item(config):
+    if config.pluginmanager.get_plugin("doctest") is None:
+        return None
+    try:
+        from _pytest.doctest import DoctestItem  # noqa: F401
+    except ImportError:
+        return "P9 _pytest.doctest.DoctestItem"
+    return None
+
+
+def _c1_rerunfailures_client(config):
+    from .compat import rerunfailures_client
+
+    db = rerunfailures_client(config)
+    if db is not None and not (hasattr(db, "sock") and callable(getattr(db, "_sock_send", None))):
+        return "C1 pytest-rerunfailures ClientStatusDB no longer talks on .sock/_sock_send"
+    return None
+
+
+def _c3_metadata(config):
+    from .compat import metadata_plugin_key
+
+    if config.pluginmanager.get_plugin("metadata") is None:
+        return None
+    if not isinstance(metadata_plugin_key(config), pytest.StashKey):
+        return "C3 pytest-metadata metadata_key (a lane's workeroutput['metadata'])"
+    return None
+
+
+def _c4_coverage(config):
+    plugin = config.pluginmanager.get_plugin("_cov")
+    if plugin is not None and not hasattr(plugin, "cov_controller"):
+        return "C4 pytest-cov plugin.cov_controller (which engine is measuring)"
+    return None
+
+
+def _c2_rerunfailures_suspended_finalizers(config):
+    from .compat import rerunfailures_module
+
+    rf = rerunfailures_module()
+    if rf is None or not hasattr(rf, "suspended_finalizers"):
+        return None
+    # Read by name as a module global: in _restore_suspended_finalizers (16) or in
+    # pytest_runtest_teardown (15), so replacing the module attribute takes effect.
+    readers = [f for f in vars(rf).values() if callable(f) and hasattr(f, "__code__")
+               and "suspended_finalizers" in f.__code__.co_names]
+    if not isinstance(rf.suspended_finalizers, dict) or not readers:
+        return "C2 pytest-rerunfailures suspended_finalizers (module-level dict read by name)"
+    return None
+
+
+def _p10_worker_identity(config):
+    import xdist
+
+    if "__slots__" in vars(type(config)):
+        return "P10 pytest's Config class now uses __slots__"
+    readers = (xdist.get_xdist_worker_id, xdist.is_xdist_worker)
+    if not all("workerinput" in (*f.__code__.co_names, *f.__code__.co_consts) for f in readers):
+        return "P10 xdist's worker id no longer comes from config.workerinput"
+    return None
+
+
+def _p11_warnings_recorder(config):
+    if getattr(sys.flags, "context_aware_warnings", False):
+        return None
+    from _pytest.recwarn import WarningsRecorder
+
+    if "__enter__" not in vars(WarningsRecorder):
+        return "P11 _pytest.recwarn.WarningsRecorder.__enter__"
+    return None
+
+
+def _p12_cache(config):
+    if config.pluginmanager.get_plugin("cacheprovider") is None:
+        return None
+    from _pytest.cacheprovider import Cache
+
+    from .isolation import CACHE_METHODS
+
+    if not all(callable(Cache.__dict__.get(name)) for name in CACHE_METHODS):
+        return "P12 _pytest.cacheprovider.Cache.get/set"
+    return None
+
+
+def _p13_redirect(config):
+    from .capture import check_p13
+
+    return check_p13() if config.getoption("capture") != "no" else None
+
+
+def _x2_worker_interactor(config):
+    if not hasattr(config, "workerinput"):
+        return None                     # only a hybrid worker takes over xdist's loop
+    from .worker import find_worker_interactor
+
+    try:
+        interactor = find_worker_interactor(config.pluginmanager)
+    except StopIteration:
+        return "X2 xdist WorkerInteractor (not registered, or renamed)"
+    forward = getattr(type(interactor), "pytest_runtest_logreport", None)
+    if not (hasattr(interactor, "channel") and callable(getattr(interactor, "sendevent", None))
+            and forward is not None and "item_index" in forward.__code__.co_names):
+        return "X2 xdist WorkerInteractor.channel / .sendevent / .item_index"
+    return None
+
+
+def _p15_capture_suspend(config):
+    from .capture import check_p15
+
+    return check_p15(config)
+
+
+def _p14_patch_guard(config):
+    from .isolation import check_p14
+
+    return check_p14()
+
+
+def _p4_hookexec(config):
+    if not hasattr(config.pluginmanager, "_inner_hookexec"):
+        return "P4 pluggy PluginManager._inner_hookexec"
+    return None
+
+
+def _p5_group_suffix(config):
+    import inspect
+
+    try:
+        from xdist.remote import WorkerInteractor
+        params = list(inspect.signature(WorkerInteractor.pytest_collection_modifyitems).parameters)
+    except (ImportError, AttributeError, TypeError, ValueError) as e:
+        return f"P5 xdist.remote.WorkerInteractor.pytest_collection_modifyitems ({e})"
+    if params != ["self", "config", "items"]:
+        return f"P5 xdist.remote.WorkerInteractor.pytest_collection_modifyitems signature {params}"
+    return None
+
+
+def _p6_current_test_var(config):
+    import os
+    from types import SimpleNamespace
+
+    from _pytest import runner
+
+    from .isolation import CURRENT_TEST_VAR, _lane_environ_class, current_test_value
+
+    update = getattr(runner, "_update_current_test_var", None)
+    if not callable(update):
+        return "P6 _pytest.runner._update_current_test_var"
+    base = type(os.environ)
+    try:
+        os.environ.__class__ = _lane_environ_class(base)
+        os.environ.__class__ = base
+    except TypeError as e:
+        return f"P6 os.environ's class can no longer be replaced ({e})"
+    # Lanes compute the value themselves: it must be what pytest would set.
+    item = SimpleNamespace(nodeid="probe.py::test[\x00]")
+    saved = os.environ.get(CURRENT_TEST_VAR)
+    try:
+        update(item, "call")
+        got = os.environ.get(CURRENT_TEST_VAR)
+        update(item, None)
+    except Exception as e:
+        return f"P6 _pytest.runner._update_current_test_var ({type(e).__name__}: {e})"
+    finally:
+        if saved is not None:
+            os.environ[CURRENT_TEST_VAR] = saved
+    if got != current_test_value(item, "call"):
+        return f"P6 PYTEST_CURRENT_TEST format changed ({got!r})"
+    return None
+
+
+def _p7_basetemp(config):
+    if config.pluginmanager.get_plugin("tmpdir") is None:
+        return None
+    tpf = getattr(config, "_tmp_path_factory", None)
+    if tpf is None or not callable(getattr(tpf, "getbasetemp", None)) or not hasattr(tpf, "__dict__") \
+            or not {"_given_basetemp", "_basetemp"} <= set(vars(tpf)):
+        return "P7 config._tmp_path_factory (getbasetemp, _given_basetemp, _basetemp)"
+    legacy = getattr(config, "_tmpdirhandler", None)
+    if legacy is not None and "_tmppath_factory" not in vars(legacy):
+        return "P7 config._tmpdirhandler._tmppath_factory"
+    return None
+
+
+def _x1_xdist_scheduler_api(config):
+    try:
+        from xdist.remote import Producer  # noqa: F401
+        from xdist.scheduler import LoadScopeScheduling  # noqa: F401
+    except ImportError as e:
+        return f"X1 xdist scheduler API: {e}"
+    return None
+
+
+# ---- environment: process-global hooks that are not thread-safe --------------------
+def _warnings(config):
+    if config.pluginmanager.get_plugin("warnings") is not None \
+            and not getattr(sys.flags, "context_aware_warnings", False):
+        return ("warnings plugin active but catch_warnings is not thread-safe here: "
+                "use Python>=3.14 with -X context_aware_warnings=1, or -p no:warnings")
+    return None
+
+
+PYTEST_TIMEOUT_REFUSED = (
+    "pytest-timeout is active with a timeout, and in single-process lanes it cannot use "
+    "signals: on a timeout it ends the whole process, every lane with it, with no reports. "
+    "Run hybrid (-n P --lanes M, where xdist replaces the worker) or turn the timeout off.")
+
+
+def _pytest_timeout(config):
+    if hasattr(config, "workerinput") or config.pluginmanager.get_plugin("timeout") is None:
+        return None                     # hybrid worker: xdist replaces a killed process
+    try:
+        from pytest_timeout import get_env_settings
+        timeout = get_env_settings(config).timeout
+    except Exception as e:  # fail closed: we cannot tell whether a timeout is set
+        return f"pytest-timeout is active and its settings could not be read ({e!r})"
+    return PYTEST_TIMEOUT_REFUSED if timeout else None
+
+
+def _faulthandler_timeout(config):
+    if config.pluginmanager.get_plugin("faulthandler") is None:
+        return None
+    if float(config.getini("faulthandler_timeout") or 0) > 0:
+        return ("faulthandler_timeout does not work under lanes: its timer is process-wide and "
+                "every test restarts or cancels it, so it never fires for the test that hangs. "
+                "Remove it for lanes runs.")
+    return None
+
+
+def _per_test_global_hooks(config):
+    # pytest <= 8.3.5 swaps these global hooks around every test phase; newer pytest
+    # installs them once (and has a module-level pytest_configure to do it).
+    problems = []
+    for name, hook in (("threadexception", "threading.excepthook"),
+                       ("unraisableexception", "sys.unraisablehook")):
+        mod = config.pluginmanager.get_plugin(name)
+        if mod is not None and not hasattr(mod, "pytest_configure"):
+            problems.append(f"this pytest's {name} plugin swaps {hook} per test (races across lanes): "
+                            f"upgrade pytest or pass -p no:{name}")
+    return "\n  ".join(problems) or None
+
+
+CHECKS = (_p4_hookexec, _p2_fixture_caches, _p3_logging, _warnings, _p5_group_suffix, _p6_current_test_var,
+          _p7_basetemp, _p8_logger_dict, _p9_doctest_item, _per_test_global_hooks,
+          _p10_worker_identity, _p11_warnings_recorder, _p12_cache, _p13_redirect, _p14_patch_guard, _p15_capture_suspend,
+          _x2_worker_interactor,
+          _x1_xdist_scheduler_api,
+          _c1_rerunfailures_client, _c2_rerunfailures_suspended_finalizers, _c3_metadata, _c4_coverage,
+          _pytest_timeout, _faulthandler_timeout)
+
+
+def check_touchpoints(config) -> None:
+    """Every process that runs tests on lanes (single-process, hybrid worker)."""
+    _raise_if([check(config) for check in CHECKS])
+
+
+# ---- hybrid controller -----------------------------------------------------------
+def _x3_handle_crashitem(config):
+    from xdist.dsession import DSession
+
+    if not callable(getattr(DSession, "handle_crashitem", None)):
+        return "X3 xdist DSession.handle_crashitem"
+    return None
+
+
+def _x4_worker_attributes(config):
+    # LaneProxy mirrors these WorkerController attributes (set in the code checked here).
+    from xdist.dsession import DSession
+    from xdist.workermanage import WorkerController
+
+    if not ("workerinput" in WorkerController.__init__.__code__.co_names
+            and "workerinfo" in DSession.worker_workerready.__code__.co_names
+            and "workeroutput" in WorkerController.process_from_remote.__code__.co_names):
+        return "X4 xdist WorkerController.workerinput/workerinfo/workeroutput"
+    if not isinstance(vars(WorkerController).get("shutting_down"), property):
+        return "X4 xdist WorkerController.shutting_down (LaneProxy follows it)"
+    return None
+
+
+#: The environment checks are the workers': refuse here, once, rather than in every worker
+#: (each with a traceback, and a run ending "no tests ran"). The workers run the same
+#: interpreter, with the flags the controller passes on (controller.propagate_interpreter_flags).
+CONTROLLER_CHECKS = (_x3_handle_crashitem, _x4_worker_attributes, _faulthandler_timeout,
+                     _warnings, _per_test_global_hooks)
+
+
+def check_controller_touchpoints(config) -> None:
+    """The hybrid controller, which runs no tests itself."""
+    _raise_if([check(config) for check in CONTROLLER_CHECKS])
+
+
+def _raise_if(problems) -> None:
+    problems = [p for p in problems if p]
+    if problems:
+        raise pytest.UsageError("pytest-threadlanes refuses to run (fail-closed):\n  " + "\n  ".join(problems))

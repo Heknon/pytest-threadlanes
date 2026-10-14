@@ -1,0 +1,584 @@
+"""Per-lane output capture: stdout/stderr, redirects and logging (touchpoints P3, P8, P13, P15).
+
+pytest's own capture is process-wide, so lanes switch it off (``--capture=no``)
+and capture per lane instead:
+
+* ``sys.stdout``/``sys.stderr`` become ``_LaneStream`` objects that write to the
+  current lane's buffers (bytes written to their ``.buffer`` included). The
+  runner turns those buffers into report sections after each phase, as pytest's
+  CaptureManager would. With ``-s``/``--capture=no`` they are not installed, and
+  output goes straight to the terminal, as under xdist.
+* ``contextlib.redirect_stdout``/``redirect_stderr`` entered on a lane redirect that
+  lane's output only (P13): the target goes on the lane's own stack, which its
+  ``_LaneStream`` writes to, instead of replacing ``sys.stdout`` for every lane.
+  Swapping it for the process captured every other lane's prints too.
+* ``CaptureManager.suspend_global_capture``/``resume_global_capture`` on a lane also
+  suspend/resume the running test's capture fixture (P15). Plugins write to the
+  terminal between the two (``--setup-show`` does); in plain pytest that bypasses
+  a capfd fixture as a side effect of suspending global capture, which lanes turn
+  off, so the line went into the test's capfd.
+* ``sys.stdin`` becomes ``_NoStdin``, which fails a read at once, as pytest's
+  capture does. Without it, a lane reading stdin blocked on the terminal forever.
+  Left alone with ``-s``, as by pytest.
+* The logging plugin's ``caplog_handler`` and ``report_handler`` become
+  ``_LogDispatch`` stand-ins that forward to the current lane's own copies.
+  A permanent ``_LogRouter`` on the root logger does the actual emitting, so
+  pytest attaching and detaching handlers concurrently from many lanes is harmless.
+
+On the main thread (no lane), everything falls through to the real objects.
+
+P8: pytest >= 9 iterates ``logging.Logger.manager.loggerDict`` each time a test
+phase starts. Another lane creating a logger at that moment made the iteration
+raise "dictionary changed size", so the dict's views are served from a copy.
+"""
+from __future__ import annotations
+
+import codecs
+import contextlib
+import io
+import logging
+import sys
+import tempfile
+import threading
+
+from .lane import LANE
+
+
+# ------------------------------------------------------------------ stdout/stderr
+class _LaneStream(io.TextIOBase):
+    def __init__(self, real, attr: str) -> None:
+        self._real = real
+        self._attr = attr  # "out" or "err": the ThreadNode buffer to write to
+        self._binary = _LaneBinaryStream(self)
+
+    def _redirect(self):
+        """(True, target) inside this lane's innermost redirect, else (False, None)."""
+        lane = LANE.get()
+        if lane is not None and lane.redirects[self._attr]:
+            return True, lane.redirects[self._attr][-1]
+        return False, None
+
+    def write(self, s):
+        lane = LANE.get()
+        if lane is None:
+            return self._real.write(s)
+        redirected, target = self._redirect()
+        if redirected:                       # redirect_stdout(None) discards, as print() does
+            return len(s) if target is None else target.write(s)
+        return getattr(lane, self._attr).write(s)
+
+    def flush(self):
+        redirected, target = self._redirect()
+        if redirected:
+            return None if target is None else target.flush()
+        self._real.flush()
+
+    # sys.stdout stands for the redirect target inside a redirect, and for the real stream
+    # otherwise (encoding, seek(), subprocess(stdout=sys.stdout), ...). io.TextIOBase
+    # defines these itself, so __getattr__ would never see them: each is delegated here.
+    def _stream(self, name):
+        redirected, target = self._redirect()
+        if redirected:
+            if target is None:
+                raise io.UnsupportedOperation(name)
+            return target
+        return self._real
+
+    # On a lane outside a redirect, sys.stdout is the lane's capture, as pytest's sys
+    # capture is: not a tty, and no fd. Handing out the real terminal's fd let output
+    # escape the test's report (or vanish, in a hybrid worker) and turned on colours.
+    def fileno(self):
+        redirected, target = self._redirect()
+        if redirected and target is not None:
+            return target.fileno()
+        lane = LANE.get()
+        if lane is None:
+            return self._real.fileno()
+        # As under pytest's (default) fd capture: a file whose content becomes this
+        # test's captured output, so subprocess(stdout=sys.stdout) and faulthandler work.
+        f = lane.fd_files.get(self._attr)
+        if f is None:
+            f = lane.fd_files[self._attr] = tempfile.TemporaryFile(mode="w+b")
+        return f.fileno()
+
+    def isatty(self):
+        redirected, target = self._redirect()
+        if redirected:
+            return bool(target is not None and target.isatty())
+        return self._real.isatty() if LANE.get() is None else False
+
+    def writable(self):
+        return True
+
+    def readable(self):
+        redirected, target = self._redirect()
+        return bool(redirected and target is not None and target.readable())
+
+    def seekable(self):
+        redirected, target = self._redirect()
+        return bool(redirected and target is not None and target.seekable())
+
+    def seek(self, *args):
+        return self._redirect_only("seek").seek(*args)
+
+    def tell(self):
+        return self._redirect_only("tell").tell()
+
+    def truncate(self, *args):
+        return self._redirect_only("truncate").truncate(*args)
+
+    def _redirect_only(self, name):
+        redirected, target = self._redirect()
+        if redirected and target is not None:
+            return target
+        raise io.UnsupportedOperation(name)
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def close(self):
+        # Inside a redirect, close the target, as plain Python does. Outside one, this
+        # stream is every lane's stdout: a test closing it must not close it for the rest.
+        redirected, target = self._redirect()
+        if redirected and target is not None:
+            target.close()
+
+    @property
+    def closed(self):
+        redirected, target = self._redirect()
+        return bool(redirected and target is not None and target.closed)
+
+    @property
+    def encoding(self):
+        redirected, target = self._redirect()
+        stream = target if redirected and target is not None else self._real
+        return getattr(stream, "encoding", None)
+
+    @property
+    def errors(self):
+        redirected, target = self._redirect()
+        stream = target if redirected and target is not None else self._real
+        return getattr(stream, "errors", None)
+
+    @property
+    def newlines(self):
+        redirected, target = self._redirect()
+        stream = target if redirected and target is not None else self._real
+        return getattr(stream, "newlines", None)
+
+    @property
+    def buffer(self):
+        return self._binary
+
+    def __getattr__(self, name):
+        redirected, target = self._redirect()
+        if redirected and target is not None:
+            return getattr(target, name)
+        return getattr(self._real, name)
+
+
+class _LaneBinaryStream:
+    """``sys.stdout.buffer`` under lanes: bytes are decoded into the lane's text buffer."""
+
+    def __init__(self, text: _LaneStream) -> None:
+        self._text = text
+
+    def write(self, b):
+        lane = LANE.get()
+        if lane is None:
+            return self._text._real.buffer.write(b)
+        encoding = getattr(self._text._real, "encoding", None) or "utf-8"
+        redirects = lane.redirects[self._text._attr]
+        if redirects:
+            target = redirects[-1]
+            if target is None:
+                return len(b)
+            if hasattr(target, "buffer"):
+                return target.buffer.write(b)
+            target.write(bytes(b).decode(getattr(target, "encoding", None) or encoding, "replace"))
+            return len(b)
+        decoder = lane.decoders.get(self._text._attr)
+        if decoder is None:
+            decoder = lane.decoders[self._text._attr] = codecs.getincrementaldecoder(encoding)("replace")
+        getattr(lane, self._text._attr).write(decoder.decode(bytes(b)))
+        return len(b)
+
+    def flush(self):
+        self._text.flush()
+
+    def writelines(self, lines):
+        for b in lines:
+            self.write(b)
+
+    # As the text stream: on a lane these name the lane's capture, not the terminal.
+    def fileno(self):
+        return self._text.fileno()
+
+    def isatty(self):
+        return self._text.isatty()
+
+    def writable(self):
+        return True
+
+    def __getattr__(self, name):
+        return getattr(self._text._real.buffer, name)
+
+
+class _NoStdin(io.TextIOBase):
+    """sys.stdin while capturing: reads fail, with pytest's own message."""
+
+    encoding = "utf-8"
+    MESSAGE = "pytest: reading from stdin while output is captured!  Consider using `-s`."
+
+    def read(self, size=-1):
+        raise OSError(self.MESSAGE)
+
+    readline = read
+
+    def readlines(self, hint=-1):
+        raise OSError(self.MESSAGE)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raise OSError(self.MESSAGE)
+
+    def fileno(self):
+        raise io.UnsupportedOperation("redirected stdin is pseudofile, has no fileno()")
+
+    def isatty(self):
+        return False
+
+    def readable(self):
+        return False
+
+    def close(self):
+        pass
+
+    @property
+    def buffer(self):
+        return self
+
+
+# ------------------------------------------------------------------ P13: redirect_stdout
+_REDIRECTED = {"stdout": "out", "stderr": "err"}
+
+
+def check_p13():
+    """Probe: contextlib's redirect classes still look as ``per_lane_redirects`` expects."""
+    base = getattr(contextlib, "_RedirectStream", None)
+    if base is None or not {"__enter__", "__exit__"} <= set(vars(base)):
+        return "P13 contextlib._RedirectStream.__enter__/__exit__"
+    if (getattr(contextlib.redirect_stdout, "_stream", None), getattr(contextlib.redirect_stderr, "_stream", None)) \
+            != ("stdout", "stderr"):
+        return "P13 contextlib.redirect_stdout/redirect_stderr._stream"
+    probe = contextlib.redirect_stdout(None)
+    if not hasattr(probe, "_new_target"):
+        return "P13 contextlib.redirect_stdout()._new_target"
+    return None
+
+
+@contextlib.contextmanager
+def per_lane_redirects():
+    """P13: redirect_stdout/redirect_stderr on a lane redirect that lane only."""
+    base = contextlib._RedirectStream
+    enter, exit_ = base.__dict__["__enter__"], base.__dict__["__exit__"]
+
+    def __enter__(self):
+        lane = LANE.get()
+        attr = _REDIRECTED.get(self._stream)
+        per_lane = lane is not None and attr is not None and isinstance(getattr(sys, self._stream), _LaneStream)
+        self.__dict__.setdefault("_lanes_entered", []).append(lane if per_lane else None)
+        if not per_lane:
+            return enter(self)
+        lane.redirects[attr].append(self._new_target)
+        return self._new_target
+
+    def __exit__(self, *exc):
+        lane = self.__dict__["_lanes_entered"].pop()
+        if lane is None:
+            return exit_(self, *exc)
+        lane.redirects[_REDIRECTED[self._stream]].pop()
+        return None
+
+    base.__enter__, base.__exit__ = __enter__, __exit__
+    try:
+        yield
+    finally:
+        base.__enter__, base.__exit__ = enter, exit_
+
+
+# ------------------------------------------------------------------ P15: suspend capture
+def check_p15(config):
+    """Probe: CaptureManager still has what ``fixture_follows_global_suspend`` uses."""
+    capman = config.pluginmanager.get_plugin("capturemanager")
+    if capman is None:
+        return None
+    cls = type(capman)
+    if not all(callable(vars(cls).get(n)) for n in ("suspend_global_capture", "resume_global_capture",
+                                                     "suspend_fixture", "resume_fixture")):
+        return "P15 CaptureManager.suspend/resume_global_capture, suspend/resume_fixture"
+    if "_capture_fixture" not in vars(capman):
+        return "P15 CaptureManager._capture_fixture"
+    from _pytest.capture import CaptureFixture
+
+    if not callable(getattr(CaptureFixture, "_is_started", None)):
+        return "P15 CaptureFixture._is_started"
+    return None
+
+
+@contextlib.contextmanager
+def fixture_follows_global_suspend(config):
+    """P15: on a lane, suspending global capture suspends the test's capture fixture too."""
+    capman = config.pluginmanager.get_plugin("capturemanager")
+    if capman is None:
+        yield
+        return
+    cls = type(capman)
+    suspend, resume = vars(cls)["suspend_global_capture"], vars(cls)["resume_global_capture"]
+
+    def fixture_started(self) -> bool:
+        fixture = self._capture_fixture
+        return fixture is not None and fixture._is_started()
+
+    def suspend_global_capture(self, in_=False):
+        if LANE.get() is not None and fixture_started(self):
+            self.suspend_fixture()
+            self.__dict__.setdefault("_lanes_suspended", []).append(self._capture_fixture)
+        return suspend(self, in_)
+
+    def resume_global_capture(self):
+        result = resume(self)
+        suspended = self.__dict__.get("_lanes_suspended")
+        if LANE.get() is not None and suspended:
+            fixture = suspended.pop()
+            if fixture is self._capture_fixture:
+                self.resume_fixture()
+        return result
+
+    cls.suspend_global_capture, cls.resume_global_capture = suspend_global_capture, resume_global_capture
+    try:
+        yield
+    finally:
+        cls.suspend_global_capture, cls.resume_global_capture = suspend, resume
+
+
+@contextlib.contextmanager
+def per_lane_std_streams():
+    real_in, real_out, real_err = sys.stdin, sys.stdout, sys.stderr
+    sys.stdin = _NoStdin()
+    sys.stdout = _LaneStream(real_out, "out")
+    sys.stderr = _LaneStream(real_err, "err")
+    try:
+        with per_lane_redirects():
+            yield
+    finally:
+        sys.stdin, sys.stdout, sys.stderr = real_in, real_out, real_err
+
+
+# ------------------------------------------------------------------ logging (P3)
+class _LogDispatch(logging.Handler):
+    """Stands in for LoggingPlugin.caplog_handler / report_handler.
+
+    ``catching_logs()`` may attach and detach it concurrently. Under a lane it
+    never emits (the permanent ``_LogRouter`` does), so those races are harmless.
+    """
+
+    def __init__(self, key: str, fallback) -> None:
+        self.__dict__["_key"] = key
+        self.__dict__["_fallback"] = fallback
+        super().__init__()
+        self.__dict__["_ready"] = True     # from here, formatter writes go to the lane's handler
+
+    def _set_formatter(self, fmt):
+        if self.__dict__.get("_ready"):    # logging.Handler.__init__ sets it to None first
+            self._t().setFormatter(fmt)
+
+    def _t(self):
+        lane = LANE.get()
+        return self.__dict__["_fallback"] if lane is None else lane.log_handlers[self.__dict__["_key"]]
+
+    level = property(lambda s: s._t().level, lambda s, v: None)
+    records = property(lambda s: s._t().records)
+    stream = property(lambda s: s._t().stream)
+    formatter = property(lambda s: s._t().formatter, lambda s, v: s._set_formatter(v))
+
+    # caplog.handler.addFilter(...) applies to the lane's handler, which filters its records.
+    def addFilter(self, f):
+        self._t().addFilter(f)
+
+    def removeFilter(self, f):
+        self._t().removeFilter(f)
+
+    def setLevel(self, level):
+        self._t().setLevel(level)
+
+    def reset(self):
+        self._t().reset()
+
+    def clear(self):
+        self._t().clear()
+
+    def handle(self, record):
+        # Records of threads that are not lanes (a heartbeat started at session start, the
+        # main thread) belong to no test. The plugin's own handlers would keep them for the
+        # whole session (nothing resets them under lanes): they are dropped.
+        return False
+
+    def emit(self, record):  # pragma: no cover - handle() short-circuits
+        pass
+
+
+class _LogRouter(logging.Handler):
+    """Permanently attached; delivers each record to the current lane's handlers."""
+
+    def handle(self, record):
+        lane = LANE.get()
+        if lane is None:
+            return False
+        # Attached to the root and to non-propagating loggers: a logger made to propagate
+        # again (for caplog) would deliver the same record twice.
+        if record.__dict__.get("_lanes_routed"):
+            return True
+        record._lanes_routed = True
+        for h in lane.log_handlers.values():
+            if record.levelno >= h.level:
+                h.handle(record)
+        return True
+
+    def emit(self, record):  # pragma: no cover
+        pass
+
+
+class _SnapshotLoggerDict(dict):
+    """logging's registry of loggers, whose views come from an atomic copy.
+
+    ``__iter__`` must stay dict's own: ``dict.copy`` takes its C fast path only
+    while it is, and otherwise calls ``keys()`` (recursing into this class).
+    """
+
+    def keys(self):
+        return dict.copy(self).keys()
+
+    def values(self):
+        return dict.copy(self).values()
+
+    def items(self):
+        return dict.copy(self).items()
+
+
+@contextlib.contextmanager
+def snapshot_logger_dict():
+    """P8. Restores the original dict object, with any loggers created meanwhile."""
+    manager = logging.Logger.manager
+    original = manager.loggerDict
+    manager.loggerDict = _SnapshotLoggerDict(original)
+    try:
+        yield
+    finally:
+        original.update(manager.loggerDict)
+        manager.loggerDict = original
+
+
+@contextlib.contextmanager
+def per_lane_logging(config):
+    """Yields the plugin's original handlers ({"caplog": h, "report": h}) as templates
+    for ``clone_log_handlers``, or ``{}`` when the logging plugin is disabled."""
+    lp = config.pluginmanager.get_plugin("logging-plugin")
+    if lp is None:
+        yield {}
+        return
+    original = (lp.caplog_handler, lp.report_handler)
+    templates = {"caplog": lp.caplog_handler, "report": lp.report_handler}
+    lp.caplog_handler = _LogDispatch("caplog", lp.caplog_handler)
+    lp.report_handler = _LogDispatch("report", lp.report_handler)
+    root = logging.getLogger()
+    if lp.log_level is not None:  # pre-lower, so catching_logs() restoring the level is a no-op
+        root.setLevel(min(root.level, lp.log_level))
+    router = _LogRouter()
+    root.addHandler(router)
+    _ROUTING["router"] = router if PYTEST_CAPTURES_NONPROPAGATING else None
+    _ROUTING["routed"] = [root]
+    try:
+        yield templates
+    finally:
+        lp.caplog_handler, lp.report_handler = original
+        for lg in _ROUTING["routed"]:
+            lg.removeHandler(router)
+        _ROUTING["router"] = None
+        _ROUTING["routed"] = []
+
+
+def _pytest_captures_nonpropagating() -> bool:
+    """pytest >= 9 attaches its handlers to the non-propagating loggers that exist when
+    each phase starts; earlier versions only to the root logger."""
+    try:
+        from _pytest.logging import catching_logs
+    except ImportError:  # pragma: no cover - the P3 probe fails first
+        return False
+    return "propagate" in catching_logs.__enter__.__code__.co_names
+
+
+PYTEST_CAPTURES_NONPROPAGATING = _pytest_captures_nonpropagating()
+_ROUTING: dict = {"router": None, "routed": []}
+_ROUTING_LOCK = threading.Lock()
+
+
+def _route_nonpropagating_loggers() -> None:
+    """At each phase start, as pytest >= 9's catching_logs: route the non-propagating
+    loggers that exist now (the router stays attached until the session ends)."""
+    router = _ROUTING["router"]
+    if router is None:
+        return
+    with _ROUTING_LOCK:
+        for lg in list(logging.Logger.manager.loggerDict.values()):
+            if isinstance(lg, logging.Logger) and not lg.propagate and router not in lg.handlers:
+                lg.addHandler(router)
+                _ROUTING["routed"].append(lg)
+
+
+def clone_log_handlers(templates: dict) -> dict:
+    """Fresh handlers for one lane, configured like the logging plugin's own."""
+    handlers = {}
+    for key, tmpl in templates.items():
+        h = type(tmpl)()
+        h.setFormatter(tmpl.formatter)
+        h.setLevel(tmpl.level)
+        handlers[key] = h
+    return handlers
+
+
+# ------------------------------------------------------------------ per phase
+def capture_phase(item, when):
+    """Generator body for the setup/call/teardown hook wrappers: gives the lane
+    fresh buffers, then adds them to the report as pytest's CaptureManager would."""
+    lane = LANE.get()
+    if lane is None:
+        return (yield)
+    lane.out, lane.err = io.StringIO(), io.StringIO()
+    _route_nonpropagating_loggers()
+    try:
+        return (yield)
+    finally:
+        _collect_lane_output(lane)
+        item.add_report_section(when, "stdout", lane.out.getvalue())
+        item.add_report_section(when, "stderr", lane.err.getvalue())
+
+
+def _collect_lane_output(lane) -> None:
+    """Append what reached the lane's fd files, and any partial character, to its buffers."""
+    for attr in ("out", "err"):
+        decoder = lane.decoders.get(attr)
+        if decoder is not None:
+            getattr(lane, attr).write(decoder.decode(b"", final=True))
+        f = lane.fd_files.get(attr)
+        if f is not None:
+            f.flush()
+            f.seek(0)
+            data = f.read()
+            f.seek(0)
+            f.truncate()
+            if data:
+                getattr(lane, attr).write(data.decode("utf-8", "replace"))
